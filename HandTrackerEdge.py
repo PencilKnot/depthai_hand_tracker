@@ -1,7 +1,6 @@
 import numpy as np
 from collections import namedtuple
 
-from numpy.lib.arraysetops import isin
 import mediapipe_utils as mpu
 import depthai as dai
 import cv2
@@ -57,7 +56,7 @@ class HandTracker:
     - xyz : boolean, when True calculate the (x, y, z) coords of the detected palms.
     - crop : boolean which indicates if square cropping on source images is applied or not
     - internal_fps : when using the internal color camera as input source, set its FPS to this value (calling setFps()).
-    - resolution : sensor resolution "full" (1920x1080) or "ultra" (3840x2160),
+    - resolution : sensor resolution "full" (1920x1080), "ultra" (3840x2160), "800" (1280x800) or "720" (1280x720),
     - internal_frame_height : when using the internal color camera, set the frame height (calling setIspScale()).
                     The width is calculated accordingly to height and depends on value of 'crop'
     - use_gesture : boolean, when True, recognize hand poses froma predefined set of poses
@@ -144,8 +143,6 @@ class HandTracker:
         self.single_hand_tolerance_thresh = single_hand_tolerance_thresh
         self.use_same_image = use_same_image
 
-        self.device = dai.Device()
-
         if input_src == None or input_src == "rgb" or input_src == "rgb_laconic":
             # Note that here (in Host mode), specifying "rgb_laconic" has no effect
             # Color camera frames are systematically transferred to the host
@@ -155,18 +152,14 @@ class HandTracker:
                 self.resolution = (1920, 1080)
             elif resolution == "ultra":
                 self.resolution = (3840, 2160)
+            elif resolution == "800":
+                self.resolution = (1280, 800)
+            elif resolution == "720":
+                self.resolution = (1280, 720)
             else:
                 print(f"Error: {resolution} is not a valid resolution !")
                 sys.exit()
             print("Sensor resolution:", self.resolution)
-
-            if xyz:
-                # Check if the device supports stereo
-                cameras = self.device.getConnectedCameras()
-                if dai.CameraBoardSocket.LEFT in cameras and dai.CameraBoardSocket.RIGHT in cameras:
-                    self.xyz = True
-                else:
-                    print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
 
             if internal_fps is None:
                 if lm_model == "full":
@@ -212,19 +205,21 @@ class HandTracker:
             print("Invalid input source:", input_src)
             sys.exit()
         
-        # Define and start pipeline
-        usb_speed = self.device.getUsbSpeed()
-        self.device.startPipeline(self.create_pipeline())
-        print(f"Pipeline started - USB speed: {str(usb_speed).split('.')[-1]}")
+        # Define pipeline
+        self.pipeline = self.create_pipeline()
 
         # Define data queues 
         if not self.laconic:
-            self.q_video = self.device.getOutputQueue(name="cam_out", maxSize=1, blocking=False)
-        self.q_manager_out = self.device.getOutputQueue(name="manager_out", maxSize=1, blocking=False)
+            self.q_video = self.cam_video_out.createOutputQueue(maxSize=1, blocking=False)
+        self.q_manager_out = self.manager_out.createOutputQueue(maxSize=1, blocking=False)
         # For showing outputs of ImageManip nodes (debugging)
         if self.trace & 4:
-            self.q_pre_pd_manip_out = self.device.getOutputQueue(name="pre_pd_manip_out", maxSize=1, blocking=False)
-            self.q_pre_lm_manip_out = self.device.getOutputQueue(name="pre_lm_manip_out", maxSize=1, blocking=False)    
+            self.q_pre_pd_manip_out = self.pre_pd_manip_out.createOutputQueue(maxSize=1, blocking=False)
+            self.q_pre_lm_manip_out = self.pre_lm_manip_out.createOutputQueue(maxSize=1, blocking=False)    
+
+        # Start pipeline
+        self.pipeline.start()
+        print(f"Pipeline started")
 
         self.fps = FPS()
 
@@ -240,16 +235,19 @@ class HandTracker:
         print("Creating pipeline...")
         # Start defining a pipeline
         pipeline = dai.Pipeline()
-        pipeline.setOpenVINOVersion(version = dai.OpenVINO.Version.VERSION_2021_4)
         self.pd_input_length = 128
 
         # ColorCamera
         print("Creating Color Camera...")
-        cam = pipeline.createColorCamera()
+        cam = pipeline.create(dai.node.ColorCamera)
         if self.resolution[0] == 1920:
             cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        else:
+        elif self.resolution[0] == 3840:
             cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_4_K)
+        elif self.resolution[1] == 800:
+            cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_800_P)
+        elif self.resolution[1] == 720:
+            cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam.setInterleaved(False)
         cam.setIspScale(self.scale_nd[0], self.scale_nd[1])
@@ -262,38 +260,42 @@ class HandTracker:
             cam.setVideoSize(self.img_w, self.img_h)
             cam.setPreviewSize(self.img_w, self.img_h)
 
-        if not self.laconic:
-            cam_out = pipeline.createXLinkOut()
-            cam_out.setStreamName("cam_out")
-            cam_out.input.setQueueSize(1)
-            cam_out.input.setBlocking(False)
-            cam.video.link(cam_out.input)
+        self.cam_video_out = cam.video
 
         # Define manager script node
         manager_script = pipeline.create(dai.node.Script)
         manager_script.setScript(self.build_manager_script())
 
         if self.xyz:
+            # Check if the device supports stereo
+            with dai.Device() as temp_device:
+                cameras = temp_device.getConnectedCameras()
+                if not (dai.CameraBoardSocket.LEFT in cameras and dai.CameraBoardSocket.RIGHT in cameras) and not (dai.CameraBoardSocket.CAM_B in cameras and dai.CameraBoardSocket.CAM_C in cameras):
+                    print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
+                    self.xyz = False
+
+        if self.xyz:
             print("Creating MonoCameras, Stereo and SpatialLocationCalculator nodes...")
             # For now, RGB needs fixed focus to properly align with depth.
             # The value used during calibration should be used here
-            calib_data = self.device.readCalibration()
+            with dai.Device() as temp_device:
+                calib_data = temp_device.readCalibration()
             calib_lens_pos = calib_data.getLensPosition(dai.CameraBoardSocket.RGB)
             print(f"RGB calibration lens position: {calib_lens_pos}")
             cam.initialControl.setManualFocus(calib_lens_pos)
 
             mono_resolution = dai.MonoCameraProperties.SensorResolution.THE_400_P
-            left = pipeline.createMonoCamera()
+            left = pipeline.create(dai.node.MonoCamera)
             left.setBoardSocket(dai.CameraBoardSocket.LEFT)
             left.setResolution(mono_resolution)
             left.setFps(self.internal_fps)
 
-            right = pipeline.createMonoCamera()
+            right = pipeline.create(dai.node.MonoCamera)
             right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
             right.setResolution(mono_resolution)
             right.setFps(self.internal_fps)
 
-            stereo = pipeline.createStereoDepth()
+            stereo = pipeline.create(dai.node.StereoDepth)
             stereo.setConfidenceThreshold(230)
             # LR-check is required for depth alignment
             stereo.setLeftRightCheck(True)
@@ -303,10 +305,10 @@ class HandTracker:
             # Otherwise : [critical] Fatal error. Please report to developers. Log: 'StereoSipp' '533'
             # stereo.setMedianFilter(dai.StereoDepthProperties.MedianFilter.MEDIAN_OFF)
 
-            spatial_location_calculator = pipeline.createSpatialLocationCalculator()
-            spatial_location_calculator.setWaitForConfigInput(True)
+            spatial_location_calculator = pipeline.create(dai.node.SpatialLocationCalculator)
+            spatial_location_calculator.inputConfig.setWaitForMessage(True)
             spatial_location_calculator.inputDepth.setBlocking(False)
-            spatial_location_calculator.inputDepth.setQueueSize(1)
+            spatial_location_calculator.inputDepth.setMaxSize(1)
 
             left.out.link(stereo.left)
             right.out.link(stereo.right)    
@@ -320,17 +322,15 @@ class HandTracker:
         print("Creating Palm Detection pre processing image manip...")
         pre_pd_manip = pipeline.create(dai.node.ImageManip)
         pre_pd_manip.setMaxOutputFrameSize(self.pd_input_length*self.pd_input_length*3)
-        pre_pd_manip.setWaitForConfigInput(True)
-        pre_pd_manip.inputImage.setQueueSize(1)
+        pre_pd_manip.inputConfig.setWaitForMessage(True)
+        pre_pd_manip.inputImage.setMaxSize(1)
         pre_pd_manip.inputImage.setBlocking(False)
         cam.preview.link(pre_pd_manip.inputImage)
         manager_script.outputs['pre_pd_manip_cfg'].link(pre_pd_manip.inputConfig)
 
         # For debugging
         if self.trace & 4:
-            pre_pd_manip_out = pipeline.createXLinkOut()
-            pre_pd_manip_out.setStreamName("pre_pd_manip_out")
-            pre_pd_manip.out.link(pre_pd_manip_out.input)
+            self.pre_pd_manip_out = pre_pd_manip.out
 
         # Define palm detection model
         print("Creating Palm Detection Neural Network...")
@@ -346,25 +346,21 @@ class HandTracker:
         post_pd_nn.out.link(manager_script.inputs['from_post_pd_nn'])
         
         # Define link to send result to host 
-        manager_out = pipeline.create(dai.node.XLinkOut)
-        manager_out.setStreamName("manager_out")
-        manager_script.outputs['host'].link(manager_out.input)
+        self.manager_out = manager_script.outputs['host']
 
         # Define landmark pre processing image manip
         print("Creating Hand Landmark pre processing image manip...") 
         self.lm_input_length = 224
         pre_lm_manip = pipeline.create(dai.node.ImageManip)
         pre_lm_manip.setMaxOutputFrameSize(self.lm_input_length*self.lm_input_length*3)
-        pre_lm_manip.setWaitForConfigInput(True)
-        pre_lm_manip.inputImage.setQueueSize(1)
+        pre_lm_manip.inputConfig.setWaitForMessage(True)
+        pre_lm_manip.inputImage.setMaxSize(1)
         pre_lm_manip.inputImage.setBlocking(False)
         cam.preview.link(pre_lm_manip.inputImage)
 
         # For debugging
         if self.trace & 4:
-            pre_lm_manip_out = pipeline.createXLinkOut()
-            pre_lm_manip_out.setStreamName("pre_lm_manip_out")
-            pre_lm_manip.out.link(pre_lm_manip_out.input)
+            self.pre_lm_manip_out = pre_lm_manip.out
 
         manager_script.outputs['pre_lm_manip_cfg'].link(pre_lm_manip.inputConfig)
 
@@ -411,7 +407,7 @@ class HandTracker:
         import re
         code = re.sub(r'"{3}.*?"{3}', '', code, flags=re.DOTALL)
         code = re.sub(r'#.*', '', code)
-        code = re.sub('\n\s*\n', '\n', code)
+        code = re.sub(r'\n\s*\n', '\n', code)
         # For debugging
         if self.trace & 8:
             with open("tmp_code.py", "w") as file:
