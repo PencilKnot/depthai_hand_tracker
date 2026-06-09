@@ -117,7 +117,7 @@ class HandTracker:
             self.max_hands = 1 if self.solo else 2
         else:
             self.max_hands = 20
-        self.xyz = False
+        self.xyz = xyz
         self.crop = crop 
         self.use_world_landmarks = use_world_landmarks
         self.internal_fps = internal_fps     
@@ -299,21 +299,8 @@ class HandTracker:
             # Camera frames to host
             self.cam_video_out = cam.video
 
-            # Check stereo availability for depth if requested
-            if self.xyz:
-                with dai.Device() as temp_device:
-                    cameras = temp_device.getConnectedCameras()
-                    if not (dai.CameraBoardSocket.LEFT in cameras and dai.CameraBoardSocket.RIGHT in cameras) and not (dai.CameraBoardSocket.CAM_B in cameras and dai.CameraBoardSocket.CAM_C in cameras):
-                        print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
-                        self.xyz = False
-
             if self.xyz:
                 print("Creating MonoCameras, Stereo and SpatialLocationCalculator nodes...")
-                with dai.Device() as temp_device:
-                    calib_data = temp_device.readCalibration()
-                calib_lens_pos = calib_data.getLensPosition(dai.CameraBoardSocket.RGB)
-                print(f"RGB calibration lens position: {calib_lens_pos}")
-                cam.initialControl.setManualFocus(calib_lens_pos)
 
                 mono_resolution = dai.MonoCameraProperties.SensorResolution.THE_400_P
                 left = pipeline.create(dai.node.MonoCamera)
@@ -327,7 +314,7 @@ class HandTracker:
                 right.setFps(self.internal_fps)
 
                 stereo = pipeline.create(dai.node.StereoDepth)
-                stereo.setConfidenceThreshold(230)
+                stereo.initialConfig.setConfidenceThreshold(230)
                 stereo.setLeftRightCheck(True)
                 stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
                 stereo.setSubpixel(False)

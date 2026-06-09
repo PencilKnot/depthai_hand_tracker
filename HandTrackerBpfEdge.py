@@ -151,7 +151,6 @@ class HandTrackerBpf:
             print("In Duo mode, body_pre_focusing is forced to 'group'")
             self.body_pre_focusing = "group"
         self.pd_score_thresh = pd_score_thresh
-        # self.pd_nms_thresh = pd_nms_thresh # pd_nms_thresh is hard coded in pp_model
         self.lm_score_thresh = lm_score_thresh
         
         self.xyz = False
@@ -164,53 +163,42 @@ class HandTrackerBpf:
         self.single_hand_tolerance_thresh = single_hand_tolerance_thresh
         self.use_same_image = use_same_image
 
-        self.device = dai.Device()
-
         if input_src == None or input_src == "rgb" or input_src == "rgb_laconic":
-            # Note that here (in Host mode), specifying "rgb_laconic" has no effect
-            # Color camera frames are systematically transferred to the host
-            self.input_type = "rgb" # OAK* internal color camera
-            self.laconic = input_src == "rgb_laconic" # Camera frames are not sent to the host
+            self.input_type = "rgb" 
+            self.laconic = input_src == "rgb_laconic" 
             if resolution == "full":
                 self.resolution = (1920, 1080)
             elif resolution == "ultra":
                 self.resolution = (3840, 2160)
+            elif resolution == "720":
+                self.resolution = (1280, 720)
             else:
                 print(f"Error: {resolution} is not a valid resolution !")
                 sys.exit()
             print("Sensor resolution:", self.resolution)
 
-            if xyz:
-                # Check if the device supports stereo
-                cameras = self.device.getConnectedCameras()
-                if dai.CameraBoardSocket.LEFT in cameras and dai.CameraBoardSocket.RIGHT in cameras:
-                    self.xyz = True
-                else:
-                    print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
+            self.xyz = xyz
+            if self.xyz:
+                with dai.Device() as temp_device:
+                    cameras = temp_device.getConnectedCameras()
+                    if not (dai.CameraBoardSocket.LEFT in cameras and dai.CameraBoardSocket.RIGHT in cameras) and not (dai.CameraBoardSocket.CAM_B in cameras and dai.CameraBoardSocket.CAM_C in cameras):
+                        print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
+                        self.xyz = False
 
             if internal_fps is None:
                 if lm_model == "full":
-                    if self.xyz:
-                        self.internal_fps = 22 
-                    else:
-                        self.internal_fps = 26 
+                    self.internal_fps = 22 if self.xyz else 26 
                 elif lm_model == "lite":
-                    if self.xyz:
-                        self.internal_fps = 29 
-                    else:
-                        self.internal_fps = 36 
+                    self.internal_fps = 29 if self.xyz else 36 
                 elif lm_model == "sparse":
-                    if self.xyz:
-                        self.internal_fps = 24 
-                    else:
-                        self.internal_fps = 29 
+                    self.internal_fps = 24 if self.xyz else 29 
                 else:
                     self.internal_fps = 39
             else:
                 self.internal_fps = internal_fps 
             print(f"Internal camera FPS set to: {self.internal_fps}") 
 
-            self.video_fps = self.internal_fps # Used when saving the output in a video file. Should be close to the real fps
+            self.video_fps = self.internal_fps 
 
             if self.crop:
                 self.frame_size, self.scale_nd = mpu.find_isp_scale_params(internal_frame_height, self.resolution)
@@ -232,24 +220,24 @@ class HandTrackerBpf:
             print("Invalid input source:", input_src)
             sys.exit()
         
-        # Defines the default crop region (pads the full image from both sides to make it a square image) 
-        # Used when the algorithm cannot reliably determine the crop region from the previous frame.
         self.crop_region = mpu.CropRegion(-self.pad_w, -self.pad_h,-self.pad_w+self.frame_size, -self.pad_h+self.frame_size, self.frame_size)
 
-        # Define and start pipeline
-        usb_speed = self.device.getUsbSpeed()
-        self.device.startPipeline(self.create_pipeline())
-        print(f"Pipeline started - USB speed: {str(usb_speed).split('.')[-1]}")
+        # Define pipeline
+        self.pipeline = self.create_pipeline()
 
         # Define data queues 
         if not self.laconic:
-            self.q_video = self.device.getOutputQueue(name="cam_out", maxSize=1, blocking=False)
-        self.q_manager_out = self.device.getOutputQueue(name="manager_out", maxSize=1, blocking=False)
-        # For showing outputs of ImageManip nodes (debugging)
+            self.q_video = self.cam_video_out.createOutputQueue(maxSize=1, blocking=False)
+        self.q_manager_out = self.manager_out.createOutputQueue(maxSize=1, blocking=False)
+        
         if self.trace & 4:
-            self.q_pre_body_manip_out = self.device.getOutputQueue(name="pre_body_manip_out", maxSize=1, blocking=False)
-            self.q_pre_pd_manip_out = self.device.getOutputQueue(name="pre_pd_manip_out", maxSize=1, blocking=False)
-            self.q_pre_lm_manip_out = self.device.getOutputQueue(name="pre_lm_manip_out", maxSize=1, blocking=False)    
+            self.q_pre_body_manip_out = self.pre_body_manip_out.createOutputQueue(maxSize=1, blocking=False)
+            self.q_pre_pd_manip_out = self.pre_pd_manip_out.createOutputQueue(maxSize=1, blocking=False)
+            self.q_pre_lm_manip_out = self.pre_lm_manip_out.createOutputQueue(maxSize=1, blocking=False)    
+
+        # Start pipeline
+        self.pipeline.start()
+        print(f"Pipeline started")
 
         self.fps = FPS()
 
@@ -261,17 +249,13 @@ class HandTrackerBpf:
         self.nb_frames_lm_inference_after_landmarks_ROI = 0
         self.nb_frames_no_hand = 0
         
-
     def create_pipeline(self):
         print("Creating pipeline...")
-        # Start defining a pipeline
         pipeline = dai.Pipeline()
-        pipeline.setOpenVINOVersion(version = dai.OpenVINO.Version.VERSION_2021_4)
         self.pd_input_length = 128
 
-        # ColorCamera
         print("Creating Color Camera...")
-        cam = pipeline.createColorCamera()
+        cam = pipeline.create(dai.node.ColorCamera)
         if self.resolution[0] == 1920:
             cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
         else:
@@ -288,12 +272,7 @@ class HandTrackerBpf:
             cam.setVideoSize(self.img_w, self.img_h)
             cam.setPreviewSize(self.img_w, self.img_h)
 
-        if not self.laconic:
-            cam_out = pipeline.createXLinkOut()
-            cam_out.setStreamName("cam_out")
-            cam_out.input.setQueueSize(1)
-            cam_out.input.setBlocking(False)
-            cam.video.link(cam_out.input)
+        self.cam_video_out = cam.video
 
         # Define manager script node
         manager_script = pipeline.create(dai.node.Script)
@@ -301,124 +280,98 @@ class HandTrackerBpf:
 
         if self.xyz:
             print("Creating MonoCameras, Stereo and SpatialLocationCalculator nodes...")
-            # For now, RGB needs fixed focus to properly align with depth.
-            # The value used during calibration should be used here
-            calib_data = self.device.readCalibration()
+            with dai.Device() as temp_device:
+                calib_data = temp_device.readCalibration()
             calib_lens_pos = calib_data.getLensPosition(dai.CameraBoardSocket.RGB)
             print(f"RGB calibration lens position: {calib_lens_pos}")
             cam.initialControl.setManualFocus(calib_lens_pos)
 
             mono_resolution = dai.MonoCameraProperties.SensorResolution.THE_400_P
-            left = pipeline.createMonoCamera()
+            left = pipeline.create(dai.node.MonoCamera)
             left.setBoardSocket(dai.CameraBoardSocket.LEFT)
             left.setResolution(mono_resolution)
             left.setFps(self.internal_fps)
 
-            right = pipeline.createMonoCamera()
+            right = pipeline.create(dai.node.MonoCamera)
             right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
             right.setResolution(mono_resolution)
             right.setFps(self.internal_fps)
 
-            stereo = pipeline.createStereoDepth()
-            stereo.setConfidenceThreshold(230)
-            # LR-check is required for depth alignment
+            stereo = pipeline.create(dai.node.StereoDepth)
+            stereo.initialConfig.setConfidenceThreshold(230)
             stereo.setLeftRightCheck(True)
             stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
-            stereo.setSubpixel(False)  # subpixel True brings latency
-            # MEDIAN_OFF necessary in depthai 2.7.2. 
-            # Otherwise : [critical] Fatal error. Please report to developers. Log: 'StereoSipp' '533'
-            # stereo.setMedianFilter(dai.StereoDepthProperties.MedianFilter.MEDIAN_OFF)
+            stereo.setSubpixel(False)
 
-            spatial_location_calculator = pipeline.createSpatialLocationCalculator()
-            spatial_location_calculator.setWaitForConfigInput(True)
+            spatial_location_calculator = pipeline.create(dai.node.SpatialLocationCalculator)
+            spatial_location_calculator.inputConfig.setWaitForMessage(True)
             spatial_location_calculator.inputDepth.setBlocking(False)
-            spatial_location_calculator.inputDepth.setQueueSize(1)
+            spatial_location_calculator.inputDepth.setMaxSize(1)
 
             left.out.link(stereo.left)
             right.out.link(stereo.right)    
-
             stereo.depth.link(spatial_location_calculator.inputDepth)
 
             manager_script.outputs['spatial_location_config'].link(spatial_location_calculator.inputConfig)
             spatial_location_calculator.out.link(manager_script.inputs['spatial_data'])            
 
-        # Define body pose detection pre processing: resize preview to (self.body_input_length, self.body_input_length)
-        # and transform BGR to RGB
         print("Creating Body Pose Detection pre processing image manip...")
         pre_body_manip = pipeline.create(dai.node.ImageManip)
         pre_body_manip.setMaxOutputFrameSize(self.body_input_length*self.body_input_length*3)
-        pre_body_manip.setWaitForConfigInput(True)
-        pre_body_manip.inputImage.setQueueSize(1)
+        pre_body_manip.inputConfig.setWaitForMessage(True)
+        pre_body_manip.inputImage.setMaxSize(1)
         pre_body_manip.inputImage.setBlocking(False)
         cam.preview.link(pre_body_manip.inputImage)
         manager_script.outputs['pre_body_manip_cfg'].link(pre_body_manip.inputConfig)
-        # For debugging
+        
         if self.trace & 4:
-            pre_body_manip_out = pipeline.createXLinkOut()
-            pre_body_manip_out.setStreamName("pre_body_manip_out")
-            pre_body_manip.out.link(pre_body_manip_out.input)
+            self.pre_body_manip_out = pre_body_manip.out
 
-        # Define landmark model
         print("Creating Body Pose Detection Neural Network...")          
         body_nn = pipeline.create(dai.node.NeuralNetwork)
         body_nn.setBlobPath(self.body_model)
-        # lm_nn.setNumInferenceThreads(1)
         pre_body_manip.out.link(body_nn.input)
         body_nn.out.link(manager_script.inputs['from_body_nn'])
 
-        # Define palm detection pre processing: resize preview to (self.pd_input_length, self.pd_input_length)
         print("Creating Palm Detection pre processing image manip...")
         pre_pd_manip = pipeline.create(dai.node.ImageManip)
         pre_pd_manip.setMaxOutputFrameSize(self.pd_input_length*self.pd_input_length*3)
-        pre_pd_manip.setWaitForConfigInput(True)
-        pre_pd_manip.inputImage.setQueueSize(1)
+        pre_pd_manip.inputConfig.setWaitForMessage(True)
+        pre_pd_manip.inputImage.setMaxSize(1)
         pre_pd_manip.inputImage.setBlocking(False)
         cam.preview.link(pre_pd_manip.inputImage)
         manager_script.outputs['pre_pd_manip_cfg'].link(pre_pd_manip.inputConfig)
 
-        # For debugging
         if self.trace & 4:
-            pre_pd_manip_out = pipeline.createXLinkOut()
-            pre_pd_manip_out.setStreamName("pre_pd_manip_out")
-            pre_pd_manip.out.link(pre_pd_manip_out.input)
+            self.pre_pd_manip_out = pre_pd_manip.out
 
-        # Define palm detection model
         print("Creating Palm Detection Neural Network...")
         pd_nn = pipeline.create(dai.node.NeuralNetwork)
         pd_nn.setBlobPath(self.pd_model)
         pre_pd_manip.out.link(pd_nn.input)
 
-        # Define pose detection post processing "model"
         print("Creating Palm Detection post processing Neural Network...")
         post_pd_nn = pipeline.create(dai.node.NeuralNetwork)
         post_pd_nn.setBlobPath(self.pp_model)
         pd_nn.out.link(post_pd_nn.input)
         post_pd_nn.out.link(manager_script.inputs['from_post_pd_nn'])
         
-        # Define link to send result to host 
-        manager_out = pipeline.create(dai.node.XLinkOut)
-        manager_out.setStreamName("manager_out")
-        manager_script.outputs['host'].link(manager_out.input)
+        self.manager_out = manager_script.outputs['host']
 
-        # Define landmark pre processing image manip
         print("Creating Hand Landmark pre processing image manip...") 
         self.lm_input_length = 224
         pre_lm_manip = pipeline.create(dai.node.ImageManip)
         pre_lm_manip.setMaxOutputFrameSize(self.lm_input_length*self.lm_input_length*3)
-        pre_lm_manip.setWaitForConfigInput(True)
-        pre_lm_manip.inputImage.setQueueSize(1)
+        pre_lm_manip.inputConfig.setWaitForMessage(True)
+        pre_lm_manip.inputImage.setMaxSize(1)
         pre_lm_manip.inputImage.setBlocking(False)
         cam.preview.link(pre_lm_manip.inputImage)
 
-        # For debugging
         if self.trace & 4:
-            pre_lm_manip_out = pipeline.createXLinkOut()
-            pre_lm_manip_out.setStreamName("pre_lm_manip_out")
-            pre_lm_manip.out.link(pre_lm_manip_out.input)
+            self.pre_lm_manip_out = pre_lm_manip.out
 
         manager_script.outputs['pre_lm_manip_cfg'].link(pre_lm_manip.inputConfig)
 
-        # Define landmark model
         print(f"Creating Hand Landmark Neural Network ({'1 thread' if self.lm_nb_threads == 1 else '2 threads'})...")          
         lm_nn = pipeline.create(dai.node.NeuralNetwork)
         lm_nn.setBlobPath(self.lm_model)
@@ -430,17 +383,9 @@ class HandTrackerBpf:
         return pipeline        
     
     def build_manager_script(self):
-        '''
-        The code of the scripting node 'manager_script' depends on :
-            - the score threshold,
-            - the video frame shape
-        So we build this code from the content of the file template_manager_script_*.py which is a python template
-        '''
-        # Read the template
         with open(TEMPLATE_MANAGER_SCRIPT_SOLO if self.solo else TEMPLATE_MANAGER_SCRIPT_DUO, 'r') as file:
             template = Template(file.read())
 
-        # Perform the substitution
         code = template.substitute(
                     _TRACE1 = "node.warn" if self.trace & 1 else "#",
                     _TRACE2 = "node.warn" if self.trace & 2 else "#",
@@ -460,12 +405,11 @@ class HandTrackerBpf:
                     _IF_USE_SAME_IMAGE = "" if self.use_same_image else '"""',
                     _IF_USE_WORLD_LANDMARKS = "" if self.use_world_landmarks else '"""',
         )
-        # Remove comments and empty lines
         import re
         code = re.sub(r'"{3}.*?"{3}', '', code, flags=re.DOTALL)
         code = re.sub(r'#.*', '', code)
-        code = re.sub('\n\s*\n', '\n', code)
-        # For debugging
+        code = re.sub(r'\n\s*\n', '\n', code)
+        
         if self.trace & 8:
             with open("tmp_code.py", "w") as file:
                 file.write(code)
@@ -487,7 +431,7 @@ class HandTrackerBpf:
         if self.xyz:
             hand.xyz = np.array(res["xyz"][hand_idx])
             hand.xyz_zone = res["xyz_zone"][hand_idx]
-        # If we added padding to make the image square, we need to remove this padding from landmark coordinates and from rect_points
+
         if self.pad_h > 0:
             hand.landmarks[:,1] -= self.pad_h
             for i in range(len(hand.rect_points)):
@@ -497,7 +441,6 @@ class HandTrackerBpf:
             for i in range(len(hand.rect_points)):
                 hand.rect_points[i][0] -= self.pad_w
 
-        # World landmarks
         if self.use_world_landmarks:
             hand.world_landmarks = np.array(res["world_lms"][hand_idx]).reshape(-1, 3)
 
@@ -506,7 +449,6 @@ class HandTrackerBpf:
         return hand  
 
     def next_frame(self):
-
         self.fps.update()
 
         if self.laconic:
@@ -515,30 +457,26 @@ class HandTrackerBpf:
             in_video = self.q_video.get()
             video_frame = in_video.getCvFrame()       
 
-        # For debugging
         if self.trace & 4:
             pre_body_manip = self.q_pre_body_manip_out.tryGet()
             if pre_body_manip:
-                pre_pd_manip = pre_body_manip.getCvFrame()
-                cv2.imshow("pre_body_manip", pre_pd_manip)
+                pre_body_frame = pre_body_manip.getCvFrame()
+                cv2.imshow("pre_body_manip", pre_body_frame)
             pre_pd_manip = self.q_pre_pd_manip_out.tryGet()
             if pre_pd_manip:
-                pre_pd_manip = pre_pd_manip.getCvFrame()
-                cv2.imshow("pre_pd_manip", pre_pd_manip)
+                pre_pd_frame = pre_pd_manip.getCvFrame()
+                cv2.imshow("pre_pd_manip", pre_pd_frame)
             pre_lm_manip = self.q_pre_lm_manip_out.tryGet()
             if pre_lm_manip:
-                pre_lm_manip = pre_lm_manip.getCvFrame()
-                cv2.imshow("pre_lm_manip", pre_lm_manip)
+                pre_lm_frame = pre_lm_manip.getCvFrame()
+                cv2.imshow("pre_lm_manip", pre_lm_frame)
 
-        # Get result from device
         res = marshal.loads(self.q_manager_out.get().getData())
         hands = []
         for i in range(len(res.get("lm_score",[]))):
             hand = self.extract_hand_data(res, i)
             hands.append(hand)
 
-
-        # Statistics
         if self.stats:
             if res["bd_pd_inf"] == 1:
                 self.nb_frames_body_inference += 1
@@ -557,10 +495,8 @@ class HandTrackerBpf:
 
         return video_frame, hands, None
 
-
     def exit(self):
         self.device.close()
-        # Print some stats
         if self.stats:
             nb_frames = self.fps.nb_frames()
             print(f"FPS : {self.fps.get_global():.1f} f/s (# frames = {nb_frames})")

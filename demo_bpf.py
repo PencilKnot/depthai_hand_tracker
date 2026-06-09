@@ -28,8 +28,8 @@ parser_tracker.add_argument('-c', '--crop', action="store_true",
                     help="Center crop frames to a square shape")
 parser_tracker.add_argument('-f', '--internal_fps', type=int, 
                     help="Fps of internal color camera. Too high value lower NN fps (default= depends on the model)")                    
-parser_tracker.add_argument("-r", "--resolution", choices=['full', 'ultra'], default='full',
-                    help="Sensor resolution: 'full' (1920x1080) or 'ultra' (3840x2160) (default=%(default)s)")
+parser_tracker.add_argument("-r", "--resolution", choices=['full', 'ultra', '720', '800'], default='full',
+                    help="Sensor resolution: 'full' (1920x1080), 'ultra' (3840x2160), '720' (1280x720), or '800' (1280x800) (default=%(default)s)")
 parser_tracker.add_argument('--internal_frame_height', type=int,                                                                                 
                     help="Internal color camera frame height in pixels") 
 parser_tracker.add_argument("-bpf", "--body_pre_focusing", default='higher', choices=['right', 'left', 'group', 'higher'],
