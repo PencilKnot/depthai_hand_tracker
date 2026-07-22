@@ -17,8 +17,62 @@ LANDMARK_MODEL_SPARSE = str(SCRIPT_DIR / "models/hand_landmark_sparse_sh4.blob")
 MOVENET_LIGHTNING_MODEL = str(SCRIPT_DIR / "models/movenet_singlepose_lightning_U8_transpose.blob")
 MOVENET_THUNDER_MODEL = str(SCRIPT_DIR / "models/movenet_singlepose_thunder_U8_transpose.blob")
 
+
+def probe_xyz_device(device_factory=dai.Device):
+    """Return stereo availability and RGB calibration focus from one device session."""
+    with device_factory() as device:
+        cameras = device.getConnectedCameras()
+        has_stereo = (
+            dai.CameraBoardSocket.LEFT in cameras
+            and dai.CameraBoardSocket.RIGHT in cameras
+        ) or (
+            dai.CameraBoardSocket.CAM_B in cameras
+            and dai.CameraBoardSocket.CAM_C in cameras
+        )
+        if not has_stereo:
+            return False, None
+
+        calibration = device.readCalibration()
+        return True, calibration.getLensPosition(dai.CameraBoardSocket.RGB)
+
+
+def create_body_manip_config(crop_region, body_input_length):
+    """Configure a perspective crop for the body-pose network input."""
+    source_points = []
+    for x, y in (
+        (crop_region.xmin, crop_region.ymin),
+        (crop_region.xmax - 1, crop_region.ymin),
+        (crop_region.xmax - 1, crop_region.ymax - 1),
+        (crop_region.xmin, crop_region.ymax - 1),
+    ):
+        point = dai.Point2f()
+        point.x, point.y = x, y
+        source_points.append(point)
+
+    destination_points = []
+    for x, y in (
+        (0, 0),
+        (body_input_length - 1, 0),
+        (body_input_length - 1, body_input_length - 1),
+        (0, body_input_length - 1),
+    ):
+        point = dai.Point2f()
+        point.x, point.y = x, y
+        destination_points.append(point)
+
+    config = dai.ImageManipConfig()
+    config.addTransformFourPoints(source_points, destination_points, False)
+    config.setOutputSize(
+        body_input_length,
+        body_input_length,
+        dai.ImageManipConfig.ResizeMode.STRETCH,
+    )
+    config.setFrameType(dai.ImgFrame.Type.RGB888p)
+    return config
+
+
 def to_planar(arr: np.ndarray, shape: tuple) -> np.ndarray:
-    return cv2.resize(arr, shape).transpose(2,0,1)#.flatten()
+    return cv2.resize(arr, shape).transpose(2, 0, 1).flatten()
 
 
 
@@ -141,6 +195,8 @@ class HandTrackerBpf:
         self.trace = trace
         self.use_gesture = use_gesture
         self.single_hand_tolerance_thresh = single_hand_tolerance_thresh
+        self.xyz = False
+        self.rgb_lens_position = None
 
         if input_src == None or input_src == "rgb" or input_src == "rgb_laconic":
             self.input_type = "rgb"
@@ -152,18 +208,23 @@ class HandTrackerBpf:
                 self.resolution = (3840, 2160)
             elif resolution == "720":
                 self.resolution = (1280, 720)
+            elif resolution == "800":
+                self.resolution = (1280, 800)
             else:
                 print(f"Error: {resolution} is not a valid resolution !")
                 sys.exit()
             print("Sensor resolution:", self.resolution)
 
-            self.xyz = xyz
-            if self.xyz:
-                with dai.Device() as temp_device:
-                    cameras = temp_device.getConnectedCameras()
-                    if not (dai.CameraBoardSocket.LEFT in cameras and dai.CameraBoardSocket.RIGHT in cameras) and not (dai.CameraBoardSocket.CAM_B in cameras and dai.CameraBoardSocket.CAM_C in cameras):
-                        print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
-                        self.xyz = False
+            if xyz:
+                try:
+                    self.xyz, self.rgb_lens_position = probe_xyz_device()
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        "Unable to access the DepthAI device for -xyz setup. "
+                        "Close any other DepthAI application and reconnect the device if needed."
+                    ) from error
+                if not self.xyz:
+                    print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
 
             self.video_fps = self.internal_fps 
             
@@ -290,8 +351,12 @@ class HandTrackerBpf:
             cam = pipeline.create(dai.node.ColorCamera)
             if self.resolution[0] == 1920:
                 cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-            else:
+            elif self.resolution[0] == 3840:
                 cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_4_K)
+            elif self.resolution[1] == 800:
+                cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_800_P)
+            elif self.resolution[1] == 720:
+                cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
             cam.setBoardSocket(dai.CameraBoardSocket.RGB)
             cam.setInterleaved(False)
             cam.setIspScale(self.scale_nd[0], self.scale_nd[1])
@@ -317,11 +382,9 @@ class HandTrackerBpf:
 
             if self.xyz:
                 print("Creating MonoCameras, Stereo and SpatialLocationCalculator nodes...")
-                with dai.Device() as temp_device:
-                    calib_data = temp_device.readCalibration()
-                calib_lens_pos = calib_data.getLensPosition(dai.CameraBoardSocket.RGB)
-                print(f"RGB calibration lens position: {calib_lens_pos}")
-                cam.initialControl.setManualFocus(calib_lens_pos)
+                print(f"RGB calibration lens position: {self.rgb_lens_position}")
+                if self.rgb_lens_position is not None:
+                    cam.initialControl.setManualFocus(self.rgb_lens_position)
 
                 mono_resolution = dai.MonoCameraProperties.SensorResolution.THE_400_P
                 left = pipeline.create(dai.node.MonoCamera)
@@ -499,22 +562,9 @@ class HandTrackerBpf:
         focus_zone = None 
         if self.input_type == "rgb":
             if not self.use_previous_landmarks:
-                cfg = dai.ImageManipConfig()                 
-                points = [
-                [self.crop_region.xmin, self.crop_region.ymin],
-                [self.crop_region.xmax-1, self.crop_region.ymin],
-                [self.crop_region.xmax-1, self.crop_region.ymax-1],
-                [self.crop_region.xmin, self.crop_region.ymax-1]]
-                point2fList = []
-                for p in points:
-                    pt = dai.Point2f()
-                    pt.x, pt.y = p[0], p[1]
-                    point2fList.append(pt)
-                cfg.setWarpTransformFourPoints(point2fList, False)
-                cfg.setResize(self.body_input_length, self.body_input_length)
-                cfg.setFrameType(dai.ImgFrame.Type.RGB888p)
-
-                self.q_manip_cfg.send(cfg)
+                self.q_manip_cfg.send(
+                    create_body_manip_config(self.crop_region, self.body_input_length)
+                )
 
             in_video = self.q_video.get()
             video_frame = in_video.getCvFrame()
@@ -725,7 +775,8 @@ class HandTrackerBpf:
         return video_frame, self.hands, bag
 
     def exit(self):
-        self.device.close()
+        if hasattr(self, "pipeline") and self.pipeline.isRunning():
+            self.pipeline.stop()
         if self.stats:
             nb_frames = self.fps.nb_frames()
             print(f"FPS : {self.fps.get_global():.1f} f/s (# frames = {nb_frames})")
